@@ -11,7 +11,8 @@ from pydantic import BaseModel
 
 from db.init import get_db
 from models.user import Customer, Admin
-from models.subscription import SubscriptionPlan, SubscriptionLog, Invoice, Payment, PaymentMethod
+from models.property import Property
+from models.subscription import SubscriptionPlan, SubscriptionLog, Invoice, Payment, PaymentMethod, OneTimeOrder
 from utils.deps import get_current_user
 
 # Simple in-memory cache for stats
@@ -31,6 +32,7 @@ class CustomerListItem(BaseModel):
     address: str
     city: str
     zip: str
+    propertyCount: int
     referralNumber: Optional[str] = None
 
 
@@ -105,6 +107,67 @@ def get_recent_invoices(
         enriched.append(i)
         
     return {"success": True, "invoices": enriched}
+
+@router.get("/all-invoices")
+def get_all_invoices(
+    db: Session = Depends(get_db),
+    current_user: Admin = Depends(get_current_user)
+):
+    if current_user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Forbidden")
+    
+    from utils.square_client import list_recent_invoices
+    # Fetch 100 recent invoices (Square)
+    res = list_recent_invoices(limit=100)
+    sq_invoices = res.get("invoices", []) if res.get("success") else []
+    
+    # Fetch all One-Time Orders (Local)
+    one_time_orders = db.query(OneTimeOrder).all()
+    
+    # Pre-fetch customers
+    customers = db.query(Customer).all()
+    customers_map = {c.square_customer_id: f"{c.first_name} {c.last_name}" for c in customers if c.square_customer_id}
+    local_customers_map = {c.id: f"{c.first_name} {c.last_name}" for c in customers}
+
+    enriched_history = []
+    
+    # Process Square Invoices
+    for inv in sq_invoices:
+        i = inv.copy()
+        amount = 0
+        if "payment_requests" in i and i["payment_requests"]:
+            for req in i["payment_requests"]:
+                 amount += int(req.get("computed_amount_money", {}).get("amount", 0))
+        elif i.get("next_payment_amount_money"):
+             amount = int(i["next_payment_amount_money"].get("amount", 0))
+        
+        enriched_history.append({
+            "id": i.get("id"),
+            "amount": amount / 100.0,
+            "status": i.get("status"),
+            "created_at": i.get("invoice_date") or i.get("scheduled_at") or i.get("created_at"),
+            "description": i.get("title") or i.get("description") or "Subscription Payment",
+            "customer_name": customers_map.get(i.get("customer_id"), "Unknown Customer"),
+            "type": "SUBSCRIPTION",
+            "public_url": i.get("public_url")
+        })
+        
+    # Process One-Time Orders
+    for order in one_time_orders:
+        enriched_history.append({
+            "id": f"OTP-{order.id}",
+            "amount": order.total_cost,
+            "status": order.payment_status or "PAID",
+            "created_at": order.created_at.isoformat(),
+            "description": f"Custom Service: {order.custom_description or order.plan_name}",
+            "customer_name": local_customers_map.get(order.customer_id, "Unknown Customer"),
+            "type": "ONE_TIME"
+        })
+        
+    # Sort by date descending
+    enriched_history.sort(key=lambda x: x["created_at"], reverse=True)
+    
+    return {"success": True, "invoices": enriched_history}
 
 @router.get("/analytics", response_model=AnalyticsResponse)
 def get_admin_analytics(
@@ -267,37 +330,40 @@ def list_customers(
             address=c.address or "",
             city=c.city or "",
             zip=c.zip_code or "",
+            propertyCount=len(c.properties),
             referralNumber=c.referral_number or ""
         ))
     
     return result
 
-@router.post("/cancel-subscription/{customer_id}")
+@router.post("/cancel-subscription/{customer_id}/{property_id}")
 def cancel_customer_subscription(
     customer_id: int,
+    property_id: int,
     db: Session = Depends(get_db),
     current_user: Admin = Depends(get_current_user)
 ):
     if current_user.get("role") != "admin":
         raise HTTPException(status_code=403, detail="Forbidden")
     
-    customer = db.query(Customer).get(customer_id)
-    if not customer or not customer.square_subscription_id:
-        raise HTTPException(status_code=404, detail="Active subscription not found")
+    property_obj = db.query(Property).filter(Property.id == property_id, Property.customer_id == customer_id).first()
+    if not property_obj or not property_obj.square_subscription_id:
+        raise HTTPException(status_code=404, detail="Active subscription not found for this property")
     
     from utils.square_client import cancel_subscription
-    res = cancel_subscription(customer.square_subscription_id)
+    res = cancel_subscription(property_obj.square_subscription_id)
     
     if not res.get("subscription"):
         raise HTTPException(status_code=400, detail="Square error or failed to cancel")
     
-    customer.subscription_active = False
-    customer.subscription_status = "CANCELED"
+    property_obj.subscription_active = False
+    property_obj.subscription_status = "CANCELED"
     
     # Log action
     log = SubscriptionLog(
-        customer_id=customer.id,
-        subscription_id=customer.square_subscription_id,
+        customer_id=customer_id,
+        property_id=property_id,
+        subscription_id=property_obj.square_subscription_id,
         action="CANCEL",
         effective_date=date.today()
     )
@@ -305,6 +371,38 @@ def cancel_customer_subscription(
     db.commit()
     
     return {"success": True, "message": "Subscription canceled"}
+
+@router.delete("/property/{customer_id}/{property_id}")
+def delete_customer_property(
+    customer_id: int,
+    property_id: int,
+    db: Session = Depends(get_db),
+    current_user: Admin = Depends(get_current_user)
+):
+    if current_user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Forbidden")
+    
+    property_obj = db.query(Property).filter(Property.id == property_id, Property.customer_id == customer_id).first()
+    if not property_obj:
+        raise HTTPException(status_code=404, detail="Property not found")
+    
+    # If there's an active Square subscription, try to cancel it but don't block deletion if it fails
+    if property_obj.square_subscription_id and property_obj.subscription_active:
+        try:
+            from utils.square_client import cancel_subscription
+            cancel_subscription(property_obj.square_subscription_id)
+        except:
+            pass
+            
+    # Cleanup history to satisfy FK constraints
+    db.query(SubscriptionLog).filter(SubscriptionLog.property_id == property_id).delete()
+    db.query(Payment).filter(Payment.property_id == property_id).delete()
+    db.query(Invoice).filter(Invoice.property_id == property_id).delete()
+    
+    db.delete(property_obj)
+    db.commit()
+    
+    return {"success": True, "message": "Property and history removed successfully"}
 
 @router.get("/customer-cards/{customer_id}")
 def get_customer_cards(
@@ -445,9 +543,10 @@ def get_customer_payments(
 class ChangeSubscriptionRequest(BaseModel):
     new_plan_variation_id: str
 
-@router.post("/change-subscription/{customer_id}")
+@router.post("/change-subscription/{customer_id}/{property_id}")
 def admin_change_subscription(
     customer_id: int,
+    property_id: int,
     request: ChangeSubscriptionRequest,
     db: Session = Depends(get_db),
     current_user: Admin = Depends(get_current_user)
@@ -455,35 +554,57 @@ def admin_change_subscription(
     if current_user.get("role") != "admin":
         raise HTTPException(status_code=403, detail="Forbidden")
     
-    customer = db.query(Customer).get(customer_id)
-    if not customer:
-        raise HTTPException(status_code=404, detail="Customer not found")
+    property_obj = db.query(Property).filter(Property.id == property_id, Property.customer_id == customer_id).first()
+    if not property_obj:
+        raise HTTPException(status_code=404, detail="Property not found")
         
-    if not customer.square_subscription_id:
-        raise HTTPException(status_code=400, detail="Customer has no active subscription")
+    if not property_obj.square_subscription_id:
+        raise HTTPException(status_code=400, detail="Property has no active subscription")
     
     from utils.square_client import update_subscription
-    res = update_subscription(customer.square_subscription_id, request.new_plan_variation_id)
+    res = update_subscription(property_obj.square_subscription_id, request.new_plan_variation_id)
     
     if not res.get("success"):
         raise HTTPException(status_code=400, detail=f"Square error: {res.get('error')}")
         
     plan = db.query(SubscriptionPlan).filter(SubscriptionPlan.plan_variation_id == request.new_plan_variation_id).first()
     if plan:
-        customer.plan_id = str(plan.id)
-        customer.plan_variation_id = request.new_plan_variation_id
+        property_obj.plan_id = str(plan.id)
+        property_obj.plan_variation_id = request.new_plan_variation_id
         
         # Log action
         log = SubscriptionLog(
-            customer_id=customer.id,
-            subscription_id=customer.square_subscription_id,
-            action="ACTIVATE", # Or "CHANGE" if we had that, but "ACTIVATE" implies new plan session
+            customer_id=customer_id,
+            property_id=property_id,
+            subscription_id=property_obj.square_subscription_id,
+            action="ACTIVATE",
             effective_date=date.today()
         )
         db.add(log)
         db.commit()
     
     return {"success": True, "message": "Subscription updated successfully"}
+
+@router.get("/customer-details/{customer_id}")
+def get_customer_details(
+    customer_id: int,
+    db: Session = Depends(get_db),
+    current_user: Admin = Depends(get_current_user)
+):
+    if current_user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Forbidden")
+        
+    customer = db.query(Customer).get(customer_id)
+    if not customer:
+        raise HTTPException(status_code=404, detail="Customer not found")
+        
+    properties = db.query(Property).filter(Property.customer_id == customer_id).all()
+    
+    return {
+        "success": True,
+        "customer": customer,
+        "properties": properties
+    }
 
 @router.post("/sync-invoices/{customer_id}")
 def sync_customer_invoices(
@@ -530,9 +651,17 @@ def sync_customer_invoices(
             due_date = datetime.now().date()
 
         if not existing:
+            # Find property_id from subscription_id if available
+            prop_id = None
+            if sq_inv.get("subscription_id"):
+                prop = db.query(Property).filter(Property.square_subscription_id == sq_inv.get("subscription_id")).first()
+                if prop:
+                    prop_id = prop.id
+            
             new_inv = Invoice(
                 square_invoice_id=inv_id,
                 customer_id=customer.id,
+                property_id=prop_id,
                 subscription_id=sq_inv.get("subscription_id"),
                 amount=amount,
                 status=sq_inv.get("status"),

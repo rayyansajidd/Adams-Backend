@@ -10,6 +10,8 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
+logger = logging.getLogger(__name__)
+logger.info("Starting Adams Property Care Backend...")
 
 load_dotenv()
 
@@ -32,12 +34,14 @@ def startup_event():
 
 # Configure CORS
 origins = [
-    "http://localhost:8081", # Current project port
+    "http://localhost:8081",
     "http://127.0.0.1:8081",
     "http://localhost:8080",
     "http://127.0.0.1:8080",
     "http://localhost:5173",
     "http://127.0.0.1:5173",
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
 ]
 
 app.add_middleware(

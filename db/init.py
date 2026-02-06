@@ -13,7 +13,8 @@ if not DATABASE_URL:
 engine = create_engine(
     DATABASE_URL,
     pool_pre_ping=True,
-    pool_recycle=3600
+    pool_recycle=3600,
+    connect_args={"connect_timeout": 5} # Prevent silent hangs
 )
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
@@ -28,7 +29,7 @@ def get_db():
 
 def init_db():
     # Import models here to register them with Base
-    from models import user, subscription
+    from models import user, subscription, property
     try:
         print("Initializing database tables...")
         Base.metadata.create_all(bind=engine)

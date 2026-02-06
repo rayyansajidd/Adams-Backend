@@ -1,4 +1,5 @@
 from sqlalchemy import Column, Integer, String, Boolean, TIMESTAMP, text
+from sqlalchemy.orm import relationship
 from db.init import Base
 
 class Customer(Base):
@@ -25,6 +26,9 @@ class Customer(Base):
     plan_variation_id = Column(String(255), nullable=True) # Square Variation ID
     
     created_at = Column(TIMESTAMP, server_default=text("NOW()"))
+
+    # Relationships
+    properties = relationship("Property", back_populates="customer")
 
 class Admin(Base):
     __tablename__ = "admins"

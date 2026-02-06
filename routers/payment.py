@@ -1,9 +1,10 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status, Header
 from sqlalchemy.orm import Session
 from typing import Optional, List, Dict, Any
 from db.init import get_db
 from models.user import Customer
-from models.subscription import SubscriptionPlan, Payment, PaymentMethod, SubscriptionLog
+from models.property import Property
+from models.subscription import SubscriptionPlan, Payment, PaymentMethod, SubscriptionLog, OneTimeOrder
 from utils.deps import get_current_user, get_db_user
 from utils.square_client import (
     get_subscription_plans,
@@ -18,7 +19,8 @@ from utils.square_client import (
     update_subscription_card,
     pause_subscription,
     resume_subscription,
-    get_customer_invoices
+    get_customer_invoices,
+    process_payment
 )
 from pydantic import BaseModel
 import os
@@ -49,16 +51,35 @@ class ValidateCardRequest(BaseModel):
 class ActivateSubscriptionRequest(BaseModel):
     plan_variation_id: str
     customer_id: Optional[int] = None # Local DB ID
+    property_id: Optional[int] = None # Local DB ID
     card_id: str
     location_id: Optional[str] = None
     idempotency_key: Optional[str] = None
     start_date: Optional[str] = None
+
+class CreatePropertyRequest(BaseModel):
+    nickname: str
+    address: str
+    city: str
+    state: str
+    zip_code: str
+    plan_variation_id: str
 
 class ChangePlanRequest(BaseModel):
     new_plan_variation_id: str
 
 class SaveCardRequest(BaseModel):
     source_id: str
+
+class OneTimePaymentRequest(BaseModel):
+    source_id: str
+    customer_info: Dict[str, Any]
+    plan_details: Dict[str, Any]
+    total_amount: float # Total in dollars
+    customer_id: Optional[int] = None
+    property_id: Optional[int] = None
+    location_id: Optional[str] = None
+    idempotency_key: Optional[str] = None
 
 # --- Endpoints ---
 
@@ -67,6 +88,100 @@ def get_square_config():
     return {
         "application_id": os.getenv("SQUARE_APPLICATION_ID", ""),
         "location_id": os.getenv("SQUARE_LOCATION_ID", "")
+    }
+
+@router.post("/one-time-payment")
+def one_time_payment(request: OneTimePaymentRequest, db: Session = Depends(get_db)):
+    """Process a one-time payment and record the order."""
+    from models.subscription import OneTimeOrder, Payment
+    
+    # 1. Create/Get Square Customer
+    sq_customer_id = None
+    customer_info = request.customer_info
+    customer_id = request.customer_id
+    
+    # Check if a customer with this email already exists OR use request.customer_id
+    from models.user import Customer
+    existing_user = None
+    if customer_id:
+        existing_user = db.query(Customer).get(customer_id)
+    
+    if not existing_user:
+        existing_user = db.query(Customer).filter(Customer.email == customer_info.get("email")).first()
+    
+    if existing_user:
+        sq_customer_id = existing_user.square_customer_id
+        customer_id = existing_user.id
+    
+    if not sq_customer_id:
+        # Generate basic name if split fails
+        full_name = customer_info.get("name", "One Time Customer")
+        name_parts = full_name.split(" ", 1)
+        given_name = name_parts[0]
+        family_name = name_parts[1] if len(name_parts) > 1 else ""
+        
+        sq_res = create_square_customer(
+            given_name=given_name,
+            family_name=family_name,
+            email=customer_info.get("email")
+        )
+        if sq_res.get("success"):
+            sq_customer_id = sq_res.get("customer_id")
+            
+            if existing_user:
+                existing_user.square_customer_id = sq_customer_id
+                db.commit()
+
+    # 2. Process Payment in Square
+    idempotency_key = request.idempotency_key or f"otp-{uuid.uuid4().hex}"
+    
+    logger.info(f"Attempting one-time payment: Amount=${request.total_amount}, Source={request.source_id[:15]}...")
+    
+    payment_res = process_payment(
+        source_id=request.source_id,
+        amount=request.total_amount,
+        idempotency_key=idempotency_key,
+        location_id=request.location_id
+    )
+    
+    if "errors" in payment_res:
+        error_msg = payment_res['errors'][0].get('detail', 'Unknown error')
+        logger.error(f"Square payment fail. Full Response: {payment_res}")
+        raise HTTPException(status_code=400, detail=f"Payment failed: {error_msg}")
+
+    payment_data = payment_res.get("payment", {})
+    square_payment_id = payment_data.get("id")
+    
+    # 3. Create OneTimeOrder record
+    new_order = OneTimeOrder(
+        customer_id=existing_user.id if existing_user else None,
+        property_id=request.property_id,
+        plan_name=request.plan_details.get("name"),
+        plan_cost=request.plan_details.get("price"),
+        custom_description=customer_info.get("custom_description"),
+        total_cost=request.total_amount,
+        square_payment_id=square_payment_id,
+        payment_status="COMPLETED"
+    )
+    db.add(new_order)
+    
+    # 4. Also record in the global Payments table for unified billing
+    new_payment = Payment(
+        customer_id=existing_user.id if existing_user else None,
+        property_id=request.property_id,
+        amount=request.total_amount,
+        status="PAID",
+        square_transaction_id=square_payment_id
+    )
+    db.add(new_payment)
+    
+    db.commit()
+    db.refresh(new_order)
+    
+    return {
+        "success": True,
+        "order_id": new_order.id,
+        "payment": payment_data
     }
 
 @router.get("/subscription-plans")
@@ -201,6 +316,29 @@ def get_my_cards(user: Customer = Depends(get_db_user), db: Session = Depends(ge
         "cards": final_cards
     }
 
+@router.get("/properties")
+def get_properties(user: Customer = Depends(get_db_user), db: Session = Depends(get_db)):
+    """Fetch all properties for the authenticated customer."""
+    properties = db.query(Property).filter(Property.customer_id == user.id).all()
+    return {"success": True, "properties": properties}
+
+@router.post("/create-property")
+def create_property(request: CreatePropertyRequest, user: Customer = Depends(get_db_user), db: Session = Depends(get_db)):
+    """Create a new property for the customer (mini-signup flow)."""
+    new_property = Property(
+        customer_id=user.id,
+        nickname=request.nickname,
+        address=request.address,
+        city=request.city,
+        state=request.state,
+        zip_code=request.zip_code,
+        plan_variation_id=request.plan_variation_id
+    )
+    db.add(new_property)
+    db.commit()
+    db.refresh(new_property)
+    return {"success": True, "property": new_property}
+
 @router.post("/save-card")
 def save_card(request: SaveCardRequest, user: Customer = Depends(get_db_user), db: Session = Depends(get_db)):
     """
@@ -286,18 +424,55 @@ def dummy_create_subscription(customer_id: str, location_id: str, plan_variation
     }
 
 @router.post("/activate-subscription")
-def activate_sub(request: ActivateSubscriptionRequest, db: Session = Depends(get_db)):
+def activate_sub(request: ActivateSubscriptionRequest, db: Session = Depends(get_db), auth_header: Optional[str] = Header(None)):
     customer = None
     if request.customer_id:
         customer = db.query(Customer).get(request.customer_id)
     
-    sq_customer_id = customer.square_customer_id if customer else None
+    # Fallback to token if customer_id not provided (e.g. from Dashboard)
+    if not customer and auth_header:
+        try:
+            from jose import jwt
+            from utils.deps import SECRET_KEY, ALGORITHM
+            token = auth_header.replace("Bearer ", "")
+            payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+            user_id = payload.get("id")
+            if user_id:
+                customer = db.query(Customer).get(user_id)
+        except Exception as e:
+            logger.error(f"Failed to identify customer from token: {e}")
+
+    if not customer:
+        raise HTTPException(status_code=404, detail="Customer not found")
+
+    sq_customer_id = customer.square_customer_id
     if not sq_customer_id:
         raise HTTPException(status_code=400, detail="Square customer ID missing")
 
+    # Find the property
+    property_obj = None
+    if request.property_id:
+        property_obj = db.query(Property).filter(Property.id == request.property_id, Property.customer_id == customer.id).first()
+    else:
+        # Fallback to the first property if none specified (Legacy or initial signup)
+        property_obj = db.query(Property).filter(Property.customer_id == customer.id).first()
+
+    if not property_obj:
+         # If no property found, create one from customer legacy details
+         property_obj = Property(
+            customer_id=customer.id,
+            nickname="Primary Property",
+            address=customer.address,
+            city=customer.city,
+            state=customer.state,
+            zip_code=customer.zip_code
+         )
+         db.add(property_obj)
+         db.flush()
+
     location_id = request.location_id or os.getenv("SQUARE_LOCATION_ID")
     
-    # Create subscription using dummy function to match Skeeter logic
+    # Create subscription
     res = dummy_create_subscription(
         customer_id=sq_customer_id,
         location_id=location_id,
@@ -309,32 +484,42 @@ def activate_sub(request: ActivateSubscriptionRequest, db: Session = Depends(get
     if not res.get("success"):
         raise HTTPException(status_code=400, detail=f"Subscription failed: {res.get('error')}")
 
-    if customer:
-        customer.square_subscription_id = res.get("subscription_id")
-        customer.subscription_active = True
-        customer.subscription_status = "ACTIVE"
-        db.commit()
-        
-        # Log payment locally
-        plan = db.query(SubscriptionPlan).filter(SubscriptionPlan.plan_variation_id == request.plan_variation_id).first()
-        if plan:
-            new_payment = Payment(
-                customer_id=customer.id,
-                amount=plan.plan_cost,
-                status="PAID",
-                square_transaction_id=res.get("subscription_id")
-            )
-            db.add(new_payment)
-
-        # Log action
-        log = SubscriptionLog(
+    subscription_id = res.get("subscription_id")
+    
+    # Update Property
+    property_obj.square_subscription_id = subscription_id
+    property_obj.subscription_active = True
+    property_obj.subscription_status = "ACTIVE"
+    property_obj.plan_variation_id = request.plan_variation_id
+    
+    # Update Customer Legacy Fields for backward compatibility (optional but safer for now)
+    customer.square_subscription_id = subscription_id
+    customer.subscription_active = True
+    customer.subscription_status = "ACTIVE"
+    customer.plan_variation_id = request.plan_variation_id
+    
+    # Log payment locally
+    plan = db.query(SubscriptionPlan).filter(SubscriptionPlan.plan_variation_id == request.plan_variation_id).first()
+    if plan:
+        new_payment = Payment(
             customer_id=customer.id,
-            subscription_id=res.get("subscription_id"),
-            action="ACTIVATE",
-            effective_date=date.today()
+            property_id=property_obj.id,
+            amount=plan.plan_cost,
+            status="PAID",
+            square_transaction_id=subscription_id
         )
-        db.add(log)
-        db.commit()
+        db.add(new_payment)
+
+    # Log action
+    log = SubscriptionLog(
+        customer_id=customer.id,
+        property_id=property_obj.id,
+        subscription_id=subscription_id,
+        action="ACTIVATE",
+        effective_date=date.today()
+    )
+    db.add(log)
+    db.commit()
 
     return res
 
@@ -388,19 +573,21 @@ def get_my_subs(user: Customer = Depends(get_db_user)):
         
     return {"success": True, "subscriptions": enriched_subs}
 
-@router.post("/pause-subscription")
-def pause_sub(user: Customer = Depends(get_db_user), db: Session = Depends(get_db)):
-    if not user.square_subscription_id:
-        raise HTTPException(status_code=404, detail="No active subscription found")
+@router.post("/pause-subscription/{property_id}")
+def pause_sub(property_id: int, user: Customer = Depends(get_db_user), db: Session = Depends(get_db)):
+    property_obj = db.query(Property).filter(Property.id == property_id, Property.customer_id == user.id).first()
+    if not property_obj or not property_obj.square_subscription_id:
+        raise HTTPException(status_code=404, detail="Active subscription not found for this property")
     
-    res = pause_subscription(user.square_subscription_id)
+    res = pause_subscription(property_obj.square_subscription_id)
     if "errors" in res:
         raise HTTPException(status_code=400, detail=str(res["errors"]))
     
-    user.subscription_status = "PAUSED"
+    property_obj.subscription_status = "PAUSED"
     log = SubscriptionLog(
         customer_id=user.id,
-        subscription_id=user.square_subscription_id,
+        property_id=property_obj.id,
+        subscription_id=property_obj.square_subscription_id,
         action="PAUSE",
         effective_date=date.today()
     )
@@ -408,19 +595,21 @@ def pause_sub(user: Customer = Depends(get_db_user), db: Session = Depends(get_d
     db.commit()
     return res
 
-@router.post("/resume-subscription")
-def resume_sub(user: Customer = Depends(get_db_user), db: Session = Depends(get_db)):
-    if not user.square_subscription_id:
-        raise HTTPException(status_code=404, detail="No active subscription found")
+@router.post("/resume-subscription/{property_id}")
+def resume_sub(property_id: int, user: Customer = Depends(get_db_user), db: Session = Depends(get_db)):
+    property_obj = db.query(Property).filter(Property.id == property_id, Property.customer_id == user.id).first()
+    if not property_obj or not property_obj.square_subscription_id:
+        raise HTTPException(status_code=404, detail="No subscription found to resume")
     
-    res = resume_subscription(user.square_subscription_id)
+    res = resume_subscription(property_obj.square_subscription_id)
     if "errors" in res:
         raise HTTPException(status_code=400, detail=str(res["errors"]))
     
-    user.subscription_status = "ACTIVE"
+    property_obj.subscription_status = "ACTIVE"
     log = SubscriptionLog(
         customer_id=user.id,
-        subscription_id=user.square_subscription_id,
+        property_id=property_obj.id,
+        subscription_id=property_obj.square_subscription_id,
         action="RESUME",
         effective_date=date.today()
     )
@@ -428,20 +617,22 @@ def resume_sub(user: Customer = Depends(get_db_user), db: Session = Depends(get_
     db.commit()
     return res
 
-@router.post("/cancel-subscription")
-def cancel_sub(user: Customer = Depends(get_db_user), db: Session = Depends(get_db)):
-    if not user.square_subscription_id:
-        raise HTTPException(status_code=404, detail="No active subscription found")
+@router.post("/cancel-subscription/{property_id}")
+def cancel_sub(property_id: int, user: Customer = Depends(get_db_user), db: Session = Depends(get_db)):
+    property_obj = db.query(Property).filter(Property.id == property_id, Property.customer_id == user.id).first()
+    if not property_obj or not property_obj.square_subscription_id:
+        raise HTTPException(status_code=404, detail="No subscription found to cancel")
     
-    res = cancel_subscription(user.square_subscription_id)
+    res = cancel_subscription(property_obj.square_subscription_id)
     if not res.get("success"):
         raise HTTPException(status_code=400, detail=res.get("error"))
     
-    user.subscription_active = False
-    user.subscription_status = "CANCELED"
+    property_obj.subscription_active = False
+    property_obj.subscription_status = "CANCELED"
     log = SubscriptionLog(
         customer_id=user.id,
-        subscription_id=user.square_subscription_id,
+        property_id=property_obj.id,
+        subscription_id=property_obj.square_subscription_id,
         action="CANCEL",
         effective_date=date.today()
     )
@@ -449,44 +640,81 @@ def cancel_sub(user: Customer = Depends(get_db_user), db: Session = Depends(get_
     db.commit()
     return res
 
-@router.post("/change-plan")
-def change_plan(request: ChangePlanRequest, user: Customer = Depends(get_db_user), db: Session = Depends(get_db)):
-    if not user.square_subscription_id:
-        raise HTTPException(status_code=404, detail="No active subscription found")
+@router.post("/change-plan/{property_id}")
+def change_plan(property_id: int, request: ChangePlanRequest, user: Customer = Depends(get_db_user), db: Session = Depends(get_db)):
+    property_obj = db.query(Property).filter(Property.id == property_id, Property.customer_id == user.id).first()
+    if not property_obj or not property_obj.square_subscription_id:
+        raise HTTPException(status_code=404, detail="No active subscription found for this property")
     
-    res = update_subscription(user.square_subscription_id, request.new_plan_variation_id)
+    res = update_subscription(property_obj.square_subscription_id, request.new_plan_variation_id)
     if not res.get("success"):
         raise HTTPException(status_code=400, detail=res.get("error"))
+    
+    # Update local state
+    property_obj.plan_variation_id = request.new_plan_variation_id
+    db.commit()
     
     return res
 
 @router.get("/billing-history")
-def billing_history(user: Customer = Depends(get_db_user)):
+def billing_history(user: Customer = Depends(get_db_user), db: Session = Depends(get_db)):
     if not user.square_customer_id:
-        return {"success": True, "invoices": []}
+        # Even if no square customer, check for local one-time orders (though unlikely)
+        one_time_orders = db.query(OneTimeOrder).filter(OneTimeOrder.customer_id == user.id).all()
+        history = []
+        for order in one_time_orders:
+             history.append({
+                "id": f"OTP-{order.id}",
+                "amount": order.total_cost,
+                "status": order.payment_status or "PAID",
+                "created_at": order.created_at.isoformat(),
+                "description": f"Custom Service: {order.custom_description or order.plan_name}",
+                "type": "ONE_TIME"
+            })
+        return {"success": True, "invoices": history}
     
+    # 1. Fetch Square Invoices
     res = get_customer_invoices(user.square_customer_id)
-    if not res.get("success"):
-        return res
-        
-    invoices = res.get("invoices", [])
-    enriched_invoices = []
+    invoices = res.get("invoices", []) if res.get("success") else []
     
+    # 2. Fetch Local One-Time Orders
+    one_time_orders = db.query(OneTimeOrder).filter(OneTimeOrder.customer_id == user.id).all()
+    
+    enriched_history = []
+    
+    # Process Square Invoices
     for inv in invoices:
         i = inv.copy()
-        
         amount = 0
         if "payment_requests" in i and i["payment_requests"]:
             for req in i["payment_requests"]:
                  amount += int(req.get("computed_amount_money", {}).get("amount", 0))
         
-        i["amount"] = amount / 100.0 # Convert to dollars
-        i["description"] = i.get("title") or i.get("description") or "Subscription Payment"
-        i["created_at"] = i.get("invoice_date") or i.get("scheduled_at") or i.get("created_at")
-             
-        enriched_invoices.append(i)
+        enriched_history.append({
+            "id": i.get("id"),
+            "amount": amount / 100.0,
+            "status": i.get("status"),
+            "created_at": i.get("invoice_date") or i.get("scheduled_at") or i.get("created_at"),
+            "description": i.get("title") or i.get("description") or "Subscription Payment",
+            "type": "SUBSCRIPTION",
+            "public_url": i.get("public_url")
+        })
         
-    return {"success": True, "invoices": enriched_invoices}
+    # Process One-Time Orders
+    for order in one_time_orders:
+        enriched_history.append({
+            "id": f"OTP-{order.id}",
+            "amount": order.total_cost,
+            "status": order.payment_status or "PAID",
+            "created_at": order.created_at.isoformat(),
+            "description": f"Custom Service: {order.custom_description or order.plan_name}",
+            "type": "ONE_TIME"
+        })
+        
+    # Sort by date descending
+    enriched_history.sort(key=lambda x: x["created_at"], reverse=True)
+    
+    return {"success": True, "invoices": enriched_history}
 
 @router.get("/my-invoice-pdf/{square_invoice_id}")
 def download_my_invoice_pdf(
