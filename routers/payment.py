@@ -137,20 +137,24 @@ def one_time_payment(request: OneTimePaymentRequest, db: Session = Depends(get_d
     
     logger.info(f"Attempting one-time payment: Amount=${request.total_amount}, Source={request.source_id[:15]}...")
     
-    payment_res = process_payment(
-        source_id=request.source_id,
-        amount=request.total_amount,
-        idempotency_key=idempotency_key,
-        location_id=request.location_id
-    )
+    # payment_res = process_payment(
+    #     source_id=request.source_id,
+    #     amount=request.total_amount,
+    #     idempotency_key=idempotency_key,
+    #     location_id=request.location_id
+    # )
     
-    if "errors" in payment_res:
-        error_msg = payment_res['errors'][0].get('detail', 'Unknown error')
-        logger.error(f"Square payment fail. Full Response: {payment_res}")
-        raise HTTPException(status_code=400, detail=f"Payment failed: {error_msg}")
+    # if "errors" in payment_res:
+    #     error_msg = payment_res['errors'][0].get('detail', 'Unknown error')
+    #     logger.error(f"Square payment fail. Full Response: {payment_res}")
+    #     raise HTTPException(status_code=400, detail=f"Payment failed: {error_msg}")
 
-    payment_data = payment_res.get("payment", {})
-    square_payment_id = payment_data.get("id")
+    # payment_data = payment_res.get("payment", {})
+    # square_payment_id = payment_data.get("id")
+
+    # MOCK PAYMENT FOR TESTING
+    square_payment_id = f"mock_payment_{uuid.uuid4()}"
+    payment_data = {"id": square_payment_id, "amount_money": {"amount": int(request.total_amount * 100), "currency": "USD"}, "status": "COMPLETED"}
     
     # 3. Create OneTimeOrder record
     new_order = OneTimeOrder(
