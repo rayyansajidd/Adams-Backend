@@ -33,7 +33,7 @@ class CustomerListItem(BaseModel):
     city: str
     zip: str
     propertyCount: int
-    referralNumber: Optional[str] = None
+
 
 
 class PlanDistributionItem(BaseModel):
@@ -331,7 +331,7 @@ def list_customers(
             city=c.city or "",
             zip=c.zip_code or "",
             propertyCount=len(c.properties),
-            referralNumber=c.referral_number or ""
+
         ))
     
     return result

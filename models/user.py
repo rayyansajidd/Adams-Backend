@@ -14,7 +14,7 @@ class Customer(Base):
     city = Column(String)
     state = Column(String)
     zip_code = Column(String)
-    referral_number = Column(String)
+
     failed_payment_attempts = Column(Integer, default=0)
     
     # Square Integration Fields
