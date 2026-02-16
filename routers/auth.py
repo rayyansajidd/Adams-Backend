@@ -3,6 +3,7 @@ from sqlalchemy.orm import Session
 from db.init import get_db
 from models.user import Customer, Admin
 from models.subscription import SubscriptionPlan
+from models.property import Property
 from utils.security import hash_password, verify_password, create_access_token
 from typing import Optional, List
 from pydantic import BaseModel, EmailStr
