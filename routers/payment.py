@@ -506,7 +506,7 @@ def activate_sub(request: ActivateSubscriptionRequest, db: Session = Depends(get
     plan = db.query(SubscriptionPlan).filter(SubscriptionPlan.plan_variation_id == request.plan_variation_id).first()
     if plan:
         # Calculate fee
-        processing_fee = round((plan.plan_cost * 0.04) + 0.10, 2)
+        processing_fee = round(plan.plan_cost * 0.04, 2)
         total_amount = plan.plan_cost + processing_fee
         
         new_payment = Payment(
