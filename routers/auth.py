@@ -16,6 +16,8 @@ class PropertyRequest(BaseModel):
     zip: str
     plan: Optional[str] = None
     planVariationId: Optional[str] = None
+    customDescription: Optional[str] = None
+    customAmount: Optional[str] = None
 
 class SignupRequest(BaseModel):
     firstName: str
