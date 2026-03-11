@@ -406,6 +406,59 @@ def cancel_customer_subscription(
     
     return {"success": True, "message": "Subscription canceled"}
 
+@router.delete("/customer/{customer_id}")
+def delete_customer(
+    customer_id: int,
+    db: Session = Depends(get_db),
+    current_user: Admin = Depends(get_current_user)
+):
+    if current_user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Forbidden")
+    
+    customer = db.query(Customer).get(customer_id)
+    if not customer:
+        raise HTTPException(status_code=404, detail="Customer not found")
+    
+    # 1. Cancel all active Square subscriptions on customer's properties
+    properties = db.query(Property).filter(Property.customer_id == customer_id).all()
+    for prop in properties:
+        if prop.square_subscription_id and prop.subscription_active:
+            try:
+                from utils.square_client import cancel_subscription
+                cancel_subscription(prop.square_subscription_id)
+            except Exception:
+                pass  # Best effort — don't block deletion if Square fails
+    
+    # 2. Also cancel the legacy customer-level subscription if present
+    if customer.square_subscription_id and customer.subscription_active:
+        try:
+            from utils.square_client import cancel_subscription
+            cancel_subscription(customer.square_subscription_id)
+        except Exception:
+            pass
+    
+    # 3. Delete all related records (order matters for FK constraints)
+    property_ids = [p.id for p in properties]
+    
+    if property_ids:
+        db.query(SubscriptionLog).filter(SubscriptionLog.property_id.in_(property_ids)).delete(synchronize_session=False)
+        db.query(Payment).filter(Payment.property_id.in_(property_ids)).delete(synchronize_session=False)
+        db.query(Invoice).filter(Invoice.property_id.in_(property_ids)).delete(synchronize_session=False)
+    
+    # Delete records linked by customer_id (catches any without a property_id)
+    db.query(SubscriptionLog).filter(SubscriptionLog.customer_id == customer_id).delete(synchronize_session=False)
+    db.query(Payment).filter(Payment.customer_id == customer_id).delete(synchronize_session=False)
+    db.query(Invoice).filter(Invoice.customer_id == customer_id).delete(synchronize_session=False)
+    db.query(OneTimeOrder).filter(OneTimeOrder.customer_id == customer_id).delete(synchronize_session=False)
+    db.query(PaymentMethod).filter(PaymentMethod.customer_id == customer_id).delete(synchronize_session=False)
+    db.query(Property).filter(Property.customer_id == customer_id).delete(synchronize_session=False)
+    
+    # 4. Delete the customer
+    db.delete(customer)
+    db.commit()
+    
+    return {"success": True, "message": f"Customer '{customer.first_name} {customer.last_name}' and all related data deleted successfully"}
+
 @router.delete("/property/{customer_id}/{property_id}")
 def delete_customer_property(
     customer_id: int,
