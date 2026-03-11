@@ -26,6 +26,7 @@ class CustomerListItem(BaseModel):
     email: str
     phone: str
     plan: str
+    planType: str
     status: str
     amount: float
     lastPayment: str
@@ -302,6 +303,11 @@ def list_customers(
     ).group_by(Payment.customer_id).all()
     last_payment_map = {cid: dt for cid, dt in last_payments}
 
+    # Pre-fetch which customers have one-time orders
+    one_time_customer_ids = set(
+        cid for (cid,) in db.query(OneTimeOrder.customer_id).distinct().all() if cid
+    )
+
     result = []
     for c in customers:
         plan_name = "No Plan"
@@ -315,6 +321,21 @@ def list_customers(
         except (ValueError, TypeError):
             pass
 
+        # Determine plan type: Recurring (has active Square subscription) vs One-Time
+        has_active_subscription = any(
+            p.subscription_active for p in c.properties
+        ) or c.subscription_active
+        has_one_time = c.id in one_time_customer_ids
+
+        if has_active_subscription:
+            plan_type = "Recurring"
+        elif has_one_time:
+            plan_type = "One-Time"
+        elif plan_name != "No Plan":
+            plan_type = "Recurring"
+        else:
+            plan_type = "N/A"
+
         last_payment_date = last_payment_map.get(c.id)
         last_payment_str = last_payment_date.strftime("%Y-%m-%d") if last_payment_date else "N/A"
 
@@ -324,6 +345,7 @@ def list_customers(
             email=c.email,
             phone=c.phone_number or "",
             plan=plan_name,
+            planType=plan_type,
             status="Active" if c.subscription_active else "Inactive",
             amount=plan_cost,
             lastPayment=last_payment_str,
@@ -331,7 +353,6 @@ def list_customers(
             city=c.city or "",
             zip=c.zip_code or "",
             propertyCount=len(c.properties),
-
         ))
     
     return result
@@ -353,11 +374,24 @@ def cancel_customer_subscription(
     from utils.square_client import cancel_subscription
     res = cancel_subscription(property_obj.square_subscription_id)
     
-    if not res.get("subscription"):
-        raise HTTPException(status_code=400, detail="Square error or failed to cancel")
+    if not res.get("success"):
+        raise HTTPException(status_code=400, detail=f"Square error: {res.get('error', 'Failed to cancel')}")
     
     property_obj.subscription_active = False
     property_obj.subscription_status = "CANCELED"
+    
+    # Also update customer legacy fields if this was their last active property
+    other_active = db.query(Property).filter(
+        Property.customer_id == customer_id,
+        Property.id != property_id,
+        Property.subscription_active == True
+    ).count()
+    
+    if other_active == 0:
+        customer = db.query(Customer).get(customer_id)
+        if customer:
+            customer.subscription_active = False
+            customer.subscription_status = "CANCELED"
     
     # Log action
     log = SubscriptionLog(
@@ -401,6 +435,19 @@ def delete_customer_property(
     
     db.delete(property_obj)
     db.commit()
+    
+    # Also update customer legacy fields if this was their last active property
+    other_active = db.query(Property).filter(
+        Property.customer_id == customer_id,
+        Property.subscription_active == True
+    ).count()
+    
+    if other_active == 0:
+        customer = db.query(Customer).get(customer_id)
+        if customer:
+            customer.subscription_active = False
+            customer.subscription_status = "CANCELED"
+            db.commit()
     
     return {"success": True, "message": "Property and history removed successfully"}
 

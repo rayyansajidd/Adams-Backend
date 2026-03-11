@@ -637,6 +637,18 @@ def cancel_sub(property_id: int, user: Customer = Depends(get_db_user), db: Sess
     
     property_obj.subscription_active = False
     property_obj.subscription_status = "CANCELED"
+    
+    # Also update customer legacy fields if this was their last active property
+    other_active = db.query(Property).filter(
+        Property.customer_id == user.id,
+        Property.id != property_id,
+        Property.subscription_active == True
+    ).count()
+    
+    if other_active == 0:
+        user.subscription_active = False
+        user.subscription_status = "CANCELED"
+        
     log = SubscriptionLog(
         customer_id=user.id,
         property_id=property_obj.id,
