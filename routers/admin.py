@@ -51,6 +51,7 @@ class AnalyticsResponse(BaseModel):
     mrr: float
     active_subscribers: int
     total_customers: int
+    total_revenue: float
     plan_distribution: List[PlanDistributionItem]
     revenue_distribution: List[PlanDistributionItem]
     growth_history: List[GrowthItem]
@@ -240,6 +241,17 @@ def get_admin_analytics(
         
     total_customers = db.query(Customer).count()
     
+    # Calculate total revenue from Payments + OneTimeOrders
+    total_payment_revenue = db.query(func.coalesce(func.sum(Payment.amount), 0)).filter(
+        Payment.status == "PAID"
+    ).scalar() or 0.0
+    
+    total_onetime_revenue = db.query(func.coalesce(func.sum(OneTimeOrder.total_cost), 0)).filter(
+        OneTimeOrder.payment_status == "COMPLETED"
+    ).scalar() or 0.0
+    
+    total_revenue = float(total_payment_revenue) + float(total_onetime_revenue)
+    
     thirty_days_ago = datetime.now() - timedelta(days=30)
     
     daily_growth = db.query(
@@ -252,15 +264,27 @@ def get_admin_analytics(
      
     growth_map = {str(d): c for d, c in daily_growth}
 
-    # Fetch daily revenue from Invoices table
-    daily_revenue = db.query(
-        func.date(Invoice.created_at).label('date'),
-        func.sum(Invoice.amount).label('total')
-    ).filter(Invoice.created_at >= thirty_days_ago, Invoice.status == 'PAID')\
-     .group_by(func.date(Invoice.created_at))\
+    # Fetch daily revenue from Payments table (reliably populated)
+    daily_payment_revenue = db.query(
+        func.date(Payment.created_at).label('date'),
+        func.sum(Payment.amount).label('total')
+    ).filter(Payment.created_at >= thirty_days_ago, Payment.status == 'PAID')\
+     .group_by(func.date(Payment.created_at))\
      .all()
     
-    revenue_map = {str(d): float(t) for d, t in daily_revenue}
+    revenue_map = {str(d): float(t) for d, t in daily_payment_revenue}
+    
+    # Also add one-time order revenue
+    daily_onetime_revenue = db.query(
+        func.date(OneTimeOrder.created_at).label('date'),
+        func.sum(OneTimeOrder.total_cost).label('total')
+    ).filter(OneTimeOrder.created_at >= thirty_days_ago, OneTimeOrder.payment_status == 'COMPLETED')\
+     .group_by(func.date(OneTimeOrder.created_at))\
+     .all()
+    
+    for d, t in daily_onetime_revenue:
+        d_str = str(d)
+        revenue_map[d_str] = revenue_map.get(d_str, 0.0) + float(t)
     
     growth_history = []
     count_before = db.query(Customer).filter(Customer.created_at < thirty_days_ago).count()
@@ -278,6 +302,7 @@ def get_admin_analytics(
         mrr=mrr,
         active_subscribers=active_sub_count,
         total_customers=total_customers,
+        total_revenue=total_revenue,
         plan_distribution=plan_dist,
         revenue_distribution=rev_dist,
         growth_history=growth_history
@@ -437,7 +462,15 @@ def delete_customer(
         except Exception:
             pass
     
-    # 3. Delete all related records (order matters for FK constraints)
+    # 3. Delete the customer from Square's customer directory
+    if customer.square_customer_id:
+        try:
+            from utils.square_client import delete_square_customer
+            delete_square_customer(customer.square_customer_id)
+        except Exception:
+            pass  # Best effort — don't block deletion if Square fails
+    
+    # 4. Delete all related records (order matters for FK constraints)
     property_ids = [p.id for p in properties]
     
     if property_ids:
@@ -453,7 +486,7 @@ def delete_customer(
     db.query(PaymentMethod).filter(PaymentMethod.customer_id == customer_id).delete(synchronize_session=False)
     db.query(Property).filter(Property.customer_id == customer_id).delete(synchronize_session=False)
     
-    # 4. Delete the customer
+    # 5. Delete the customer
     db.delete(customer)
     db.commit()
     

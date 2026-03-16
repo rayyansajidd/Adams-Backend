@@ -141,7 +141,8 @@ def one_time_payment(request: OneTimePaymentRequest, db: Session = Depends(get_d
         source_id=request.source_id,
         amount=request.total_amount,
         idempotency_key=idempotency_key,
-        location_id=request.location_id
+        location_id=request.location_id,
+        customer_id=sq_customer_id
     )
     
     if "errors" in payment_res:

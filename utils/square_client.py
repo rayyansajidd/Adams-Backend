@@ -42,7 +42,8 @@ def process_payment(
     source_id: str,
     amount: float,
     idempotency_key: str,
-    location_id: Optional[str] = None
+    location_id: Optional[str] = None,
+    customer_id: Optional[str] = None
 ) -> Dict[str, Any]:
     """Process a payment using Square Payments API."""
     location = location_id or SQUARE_LOCATION_ID
@@ -60,6 +61,9 @@ def process_payment(
         },
         "location_id": location
     }
+    
+    if customer_id:
+        payload["customer_id"] = customer_id
     
     try:
         response = requests.post(url, json=payload, headers=headers, timeout=10)
@@ -151,6 +155,20 @@ def update_square_customer(customer_id: str, **kwargs) -> Dict[str, Any]:
         return {"success": False, "error": str(data.get("errors", "Unknown error"))}
     except Exception as e:
         logger.error(f"Error updating customer: {str(e)}")
+        return {"success": False, "error": str(e)}
+
+def delete_square_customer(customer_id: str) -> Dict[str, Any]:
+    """Delete a customer from Square's customer directory."""
+    try:
+        url = f"{get_square_base_url()}/v2/customers/{customer_id}"
+        headers = get_square_headers()
+        response = requests.delete(url, headers=headers, timeout=10)
+        if response.status_code == 200:
+            return {"success": True}
+        data = response.json()
+        return {"success": False, "error": str(data.get("errors", "Unknown error"))}
+    except Exception as e:
+        logger.error(f"Error deleting Square customer: {str(e)}")
         return {"success": False, "error": str(e)}
 
 # --- Card Operations ---
