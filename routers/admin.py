@@ -207,8 +207,11 @@ def get_admin_analytics(
     plan_counts = {}
     plan_revenue = {}
     
+    print(f"DEBUG ADMIN ANALYTICS variation_map keys: {list(variation_map.keys())}")
+    
     for sub in active_subs:
         var_id = sub.get("plan_variation_id")
+        print(f"DEBUG ADMIN ANALYTICS sub var_id: {var_id}")
         if var_id and var_id in variation_map:
             details = variation_map[var_id]
             price = details["price"]
