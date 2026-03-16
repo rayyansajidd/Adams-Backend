@@ -179,44 +179,42 @@ def get_admin_analytics(
     if current_user.get("role") != "admin":
         raise HTTPException(status_code=403, detail="Forbidden")
     
-    from utils.square_client import get_subscriptions, get_subscription_plans
+    from models.user import Customer
+    from models.subscription import SubscriptionPlan, Payment, OneTimeOrder
     
-    subs_res = get_subscriptions(status="ACTIVE")
-    print(f"DEBUG ADMIN ANALYTICS subs_res: {subs_res}")
+    # Calculate directly from local DB instead of Square API
+    active_customers = db.query(Customer).filter(
+        Customer.subscription_status == "ACTIVE"
+    ).all()
     
-    active_subs = subs_res.get("subscriptions", [])
-    active_sub_count = len(active_subs)
+    active_sub_count = len(active_customers)
     
-    plans_res = get_subscription_plans()
-    plans = plans_res.get("plans", [])
-    
-    variation_map = {}
-    for p in plans:
-        p_name = p.get("name", "Unknown Plan")
-        for v in p.get("variations", []):
-            var_id = v.get("id")
-            phases = v.get("phases", [])
-            price = 0.0
-            if phases:
-                amount_money = phases[0].get("recurring_price_money", {})
-                price = float(amount_money.get("amount", 0)) / 100.0
-            
-            variation_map[var_id] = {"name": p_name, "price": price}
-
     mrr = 0.0
     plan_counts = {}
     plan_revenue = {}
     
-    print(f"DEBUG ADMIN ANALYTICS variation_map keys: {list(variation_map.keys())}")
+    # Preload plans for quick lookup
+    db_plans = db.query(SubscriptionPlan).all()
+    variation_map = {p.plan_variation_id: {"name": p.plan_name, "price": p.plan_cost} for p in db_plans}
     
-    for sub in active_subs:
-        var_id = sub.get("plan_variation_id")
-        print(f"DEBUG ADMIN ANALYTICS sub var_id: {var_id}")
+    for customer in active_customers:
+        var_id = customer.plan_variation_id
         if var_id and var_id in variation_map:
             details = variation_map[var_id]
             price = details["price"]
             p_name = details["name"]
             
+            mrr += price
+            plan_counts[p_name] = plan_counts.get(p_name, 0) + 1
+            plan_revenue[p_name] = plan_revenue.get(p_name, 0) + price
+        elif customer.plan_id and customer.plan_id in ["basic", "standard", "premium"]:
+            p_name = f"{customer.plan_id.title()} Care Plan"
+            if customer.plan_id == "basic":
+                price = 29.99
+            elif customer.plan_id == "standard":
+                price = 49.99
+            else:
+                price = 79.99
             mrr += price
             plan_counts[p_name] = plan_counts.get(p_name, 0) + 1
             plan_revenue[p_name] = plan_revenue.get(p_name, 0) + price
