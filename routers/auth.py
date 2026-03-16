@@ -37,7 +37,13 @@ def signup(request: SignupRequest, db: Session = Depends(get_db)):
     # Check if user exists
     existing_user = db.query(Customer).filter(Customer.email == request.email).first()
     if existing_user:
-        raise HTTPException(status_code=400, detail="Email already registered")
+        # If they haven't successfully paid yet, cleanly overwrite the abandoned record
+        if existing_user.subscription_status == "PENDING":
+            db.query(Property).filter(Property.customer_id == existing_user.id).delete()
+            db.delete(existing_user)
+            db.commit()
+        else:
+            raise HTTPException(status_code=400, detail="Email already registered")
     
     # Use the hash_password utility from security.py
     hashed_password = hash_password(request.password) 
@@ -172,3 +178,20 @@ def admin_login(request: LoginRequest, db: Session = Depends(get_db)):
         "name": admin.name,
         "role": "admin"
     }}
+
+@router.delete("/cleanup-failed-signup/{customer_id}")
+def cleanup_failed_signup(customer_id: int, db: Session = Depends(get_db)):
+    """
+    Deletes a local Customer and their Properties if their subscription
+    status is PENDING. Used by the frontend when Square checkout fails.
+    """
+    customer = db.query(Customer).filter(Customer.id == customer_id).first()
+    if customer:
+        if customer.subscription_status == "PENDING":
+            db.query(Property).filter(Property.customer_id == customer.id).delete()
+            db.delete(customer)
+            db.commit()
+            return {"success": True, "message": "Cleanup complete. Pending account removed."}
+        else:
+            return {"success": False, "message": "Customer is already active"}
+    return {"success": False, "message": "Customer not found"}
