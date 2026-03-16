@@ -382,8 +382,6 @@ def get_subscriptions(customer_id: Optional[str] = None, status: Optional[str] =
         payload = {"query": {"filter": {"location_ids": [SQUARE_LOCATION_ID]}}}
         if customer_id:
             payload["query"]["filter"]["customer_ids"] = [customer_id]
-        if status:
-            payload["query"]["filter"]["statuses"] = [status]
         if cursor:
             payload["cursor"] = cursor
         
@@ -393,9 +391,14 @@ def get_subscriptions(customer_id: Optional[str] = None, status: Optional[str] =
             return {"success": False, "error": response.text, "subscriptions": []}
         
         data = response.json()
+        all_subs = data.get("subscriptions", [])
+        
+        if status:
+            all_subs = [s for s in all_subs if s.get("status") == status]
+            
         return {
             "success": True, 
-            "subscriptions": data.get("subscriptions", []), 
+            "subscriptions": all_subs, 
             "cursor": data.get("cursor")
         }
     except Exception as e:
