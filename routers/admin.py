@@ -182,6 +182,8 @@ def get_admin_analytics(
     from utils.square_client import get_subscriptions, get_subscription_plans
     
     subs_res = get_subscriptions(status="ACTIVE")
+    print(f"DEBUG ADMIN ANALYTICS subs_res: {subs_res}")
+    
     active_subs = subs_res.get("subscriptions", [])
     active_sub_count = len(active_subs)
     
