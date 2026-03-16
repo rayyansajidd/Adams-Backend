@@ -379,7 +379,7 @@ def get_subscriptions(customer_id: Optional[str] = None, status: Optional[str] =
         url = f"{get_square_base_url()}/v2/subscriptions/search"
         headers = get_square_headers()
         
-        payload = {"query": {"filter": {}}}
+        payload = {"query": {"filter": {"location_ids": [SQUARE_LOCATION_ID]}}}
         if customer_id:
             payload["query"]["filter"]["customer_ids"] = [customer_id]
         if status:
