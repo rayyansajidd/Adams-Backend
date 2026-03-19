@@ -94,8 +94,8 @@ def signup(request: SignupRequest, db: Session = Depends(get_db)):
         db.refresh(new_property)
         created_properties.append(new_property)
     
-    # Create simple access token
-    access_token = f"token_{new_user.id}"
+    # Create properly formatted JWT access token
+    access_token = create_access_token(data={"sub": new_user.email, "id": new_user.id})
     
     # Get plan details safely for the primary property (for backward compat in response)
     plan_obj = None

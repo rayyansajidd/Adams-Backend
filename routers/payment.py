@@ -325,6 +325,26 @@ def get_my_cards(user: Customer = Depends(get_db_user), db: Session = Depends(ge
 def get_properties(user: Customer = Depends(get_db_user), db: Session = Depends(get_db)):
     """Fetch all properties for the authenticated customer."""
     properties = db.query(Property).filter(Property.customer_id == user.id).all()
+    
+    # Auto-migrate legacy customer address to a property if none exists
+    if not properties and (user.address or user.city or user.zip_code):
+        new_prop = Property(
+            customer_id=user.id,
+            nickname="Primary Property",
+            address=user.address or "",
+            city=user.city or "",
+            state=user.state or "",
+            zip_code=user.zip_code or "",
+            subscription_active=user.subscription_active,
+            subscription_status=user.subscription_status,
+            square_subscription_id=user.square_subscription_id,
+            plan_variation_id=user.plan_variation_id
+        )
+        db.add(new_prop)
+        db.commit()
+        db.refresh(new_prop)
+        properties = [new_prop]
+        
     return {"success": True, "properties": properties}
 
 @router.post("/create-property")
