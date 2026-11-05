@@ -143,6 +143,42 @@ def get_square_customer_by_email(email: str) -> Dict[str, Any]:
     except Exception as e:
         return {"success": False, "error": str(e)}
 
+def get_or_create_square_customer(
+    email: str,
+    given_name: str,
+    family_name: str,
+    phone_number: Optional[str] = None,
+    address: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
+    """Reuse this account's existing Square customer for an email, or create one.
+
+    Square customer records are account-wide while subscriptions belong to a location,
+    so one person buying from several brands in this account (Adams, Skeeterman,
+    Pro Town, ...) must keep ONE customer record with their cards on it. Creating a
+    second record splits one person across two ids; when Square later merges them,
+    the id stored here stops returning invoices.
+
+    Returns the usual {"success", "customer_id"} plus "reused": True when an existing
+    record was found.
+    """
+    found = get_square_customer_by_email(email) if email else {"success": False}
+    if found.get("success") and found.get("customer_id"):
+        logger.info(f"Reusing existing Square customer {found['customer_id']} for {email}")
+        return {"success": True, "customer_id": found["customer_id"],
+                "customer": found.get("customer"), "reused": True}
+
+    res = create_square_customer(
+        given_name=given_name,
+        family_name=family_name,
+        email=email,
+        phone_number=phone_number,
+        address=address,
+    )
+    if res.get("success"):
+        res["reused"] = False
+    return res
+
+
 def update_square_customer(customer_id: str, **kwargs) -> Dict[str, Any]:
     """Update a customer in Square."""
     try:

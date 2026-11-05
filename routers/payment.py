@@ -8,7 +8,7 @@ from models.subscription import SubscriptionPlan, Payment, PaymentMethod, Subscr
 from utils.deps import get_current_user, get_db_user
 from utils.square_client import (
     get_subscription_plans,
-    create_square_customer,
+    get_or_create_square_customer,
     create_card_on_file,
     get_customer_cards,
     disable_card,
@@ -120,10 +120,10 @@ def one_time_payment(request: OneTimePaymentRequest, db: Session = Depends(get_d
         given_name = name_parts[0]
         family_name = name_parts[1] if len(name_parts) > 1 else ""
         
-        sq_res = create_square_customer(
+        sq_res = get_or_create_square_customer(
+            email=customer_info.get("email"),
             given_name=given_name,
-            family_name=family_name,
-            email=customer_info.get("email")
+            family_name=family_name
         )
         if sq_res.get("success"):
             sq_customer_id = sq_res.get("customer_id")
@@ -222,10 +222,10 @@ def validate_card(request: ValidateCardRequest, db: Session = Depends(get_db)):
         family_name = request.family_name or (customer.last_name if customer else "User")
         email = request.email or (customer.email if customer else f"guest_{uuid.uuid4().hex[:8]}@example.com")
         
-        res = create_square_customer(
+        res = get_or_create_square_customer(
+            email=email,
             given_name=given_name,
             family_name=family_name,
-            email=email,
             phone_number=request.phone_number or (customer.phone_number if customer else None)
         )
         
@@ -372,10 +372,10 @@ def save_card(request: SaveCardRequest, user: Customer = Depends(get_db_user), d
     """
     if not user.square_customer_id:
         # Should ideally have one by now if they reached dashboard, but let's be safe
-        res = create_square_customer(
+        res = get_or_create_square_customer(
+            email=user.email,
             given_name=user.first_name,
             family_name=user.last_name,
-            email=user.email,
             phone_number=user.phone_number
         )
         if not res.get("success"):
