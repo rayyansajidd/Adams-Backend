@@ -668,6 +668,93 @@ def get_customer_payments(
     if not customer or not customer.square_customer_id:
         raise HTTPException(status_code=404, detail="Square customer not found")
     
+    from utils.square_client import get_customer_invoices
+    res = get_customer_invoices(customer.square_customer_id)
+    
+    if not res.get("success"):
+        raise HTTPException(status_code=400, detail=f"Square error: {res.get('error')}")
+    
+    return res
+
+class ChangeSubscriptionRequest(BaseModel):
+    new_plan_variation_id: str
+
+@router.post("/change-subscription/{customer_id}/{property_id}")
+def admin_change_subscription(
+    customer_id: int,
+    property_id: int,
+    request: ChangeSubscriptionRequest,
+    db: Session = Depends(get_db),
+    current_user: Admin = Depends(get_current_user)
+):
+    if current_user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Forbidden")
+    
+    property_obj = db.query(Property).filter(Property.id == property_id, Property.customer_id == customer_id).first()
+    if not property_obj:
+        raise HTTPException(status_code=404, detail="Property not found")
+        
+    if not property_obj.square_subscription_id:
+        raise HTTPException(status_code=400, detail="Property has no active subscription")
+    
+    from utils.square_client import update_subscription
+    res = update_subscription(property_obj.square_subscription_id, request.new_plan_variation_id)
+    
+    if not res.get("success"):
+        raise HTTPException(status_code=400, detail=f"Square error: {res.get('error')}")
+        
+    plan = db.query(SubscriptionPlan).filter(SubscriptionPlan.plan_variation_id == request.new_plan_variation_id).first()
+    if plan:
+        property_obj.plan_id = str(plan.id)
+        property_obj.plan_variation_id = request.new_plan_variation_id
+        
+        # Log action
+        log = SubscriptionLog(
+            customer_id=customer_id,
+            property_id=property_id,
+            subscription_id=property_obj.square_subscription_id,
+            action="ACTIVATE",
+            effective_date=date.today()
+        )
+        db.add(log)
+        db.commit()
+    
+    return {"success": True, "message": "Subscription updated successfully"}
+
+@router.get("/customer-details/{customer_id}")
+def get_customer_details(
+    customer_id: int,
+    db: Session = Depends(get_db),
+    current_user: Admin = Depends(get_current_user)
+):
+    if current_user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Forbidden")
+        
+    customer = db.query(Customer).get(customer_id)
+    if not customer:
+        raise HTTPException(status_code=404, detail="Customer not found")
+        
+    properties = db.query(Property).filter(Property.customer_id == customer_id).all()
+    
+    return {
+        "success": True,
+        "customer": customer,
+        "properties": properties
+    }
+
+@router.post("/sync-invoices/{customer_id}")
+def sync_customer_invoices(
+    customer_id: int,
+    db: Session = Depends(get_db),
+    current_user: Admin = Depends(get_current_user)
+):
+    if current_user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Forbidden")
+    
+    customer = db.query(Customer).get(customer_id)
+    if not customer or not customer.square_customer_id:
+        raise HTTPException(status_code=404, detail="Customer not found or no Square ID")
+    
     from utils.invoice_sync import sync_invoices_for_customer
     res = sync_invoices_for_customer(db, customer)
     if not res.get("success"):
